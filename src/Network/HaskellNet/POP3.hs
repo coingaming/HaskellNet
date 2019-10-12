@@ -31,6 +31,7 @@ module Network.HaskellNet.POP3
     where
 
 import Network.HaskellNet.BSStream
+import Network.HaskellNet.Exception
 import Network.Socket
 import Network.Compat
 import qualified Network.HaskellNet.Auth as A
@@ -87,7 +88,8 @@ connectPop3 = flip connectPop3Port 110
 connectStream :: BSStream -> IO POP3Connection
 connectStream st =
     do (resp, msg) <- response st
-       when (resp == Err) $ fail "cannot connect"
+       when (resp == Err) $
+         throwIO (ServerError "cannot connect")
        let code = last $ BS.words msg
        if BS.head code == '<' && BS.last code == '>'
          then return $ newConnection st (BS.unpack code)
@@ -164,11 +166,13 @@ sendCommand conn command =
 
 user :: POP3Connection -> String -> IO ()
 user conn name = do (resp, _) <- sendCommand conn (USER name)
-                    when (resp == Err) $ fail "cannot send user name"
+                    when (resp == Err) $
+                      throwIO (ServerError "cannot send user name")
 
 pass :: POP3Connection -> String -> IO ()
 pass conn pwd = do (resp, _) <- sendCommand conn (PASS pwd)
-                   when (resp == Err) $ fail "cannot send password"
+                   when (resp == Err) $
+                     throwIO (ServerError "cannot send password")
 
 userPass :: POP3Connection -> A.UserName -> A.Password -> IO ()
 userPass conn name pwd = user conn name >> pass conn pwd
@@ -177,59 +181,70 @@ auth :: POP3Connection -> A.AuthType -> A.UserName -> A.Password
      -> IO ()
 auth conn at username password =
     do (resp, msg) <- sendCommand conn (AUTH at username password)
-       unless (resp == Ok) $ fail $ "authentication failed: " ++ BS.unpack msg
+       when (resp /= Ok) $
+         throwIO (AuthenticationFailed (BS.unpack msg))
 
 apop :: POP3Connection -> String -> String -> IO ()
 apop conn name pwd =
     do (resp, msg) <- sendCommand conn (APOP name pwd)
-       when (resp == Err) $ fail $ "authentication failed: " ++ BS.unpack msg
+       when (resp == Err) $
+         throwIO (AuthenticationFailed (BS.unpack msg))
 
 stat :: POP3Connection -> IO (Int, Int)
 stat conn = do (resp, msg) <- sendCommand conn STAT
-               when (resp == Err) $ fail "cannot get stat info"
+               when (resp == Err) $
+                 throwIO (ServerError "cannot get stat info")
                let (nn, mm) = BS.span (/=' ') msg
                return (read $ BS.unpack nn, read $ BS.unpack $ BS.tail mm)
 
 dele :: POP3Connection -> Int -> IO ()
 dele conn n = do (resp, _) <- sendCommand conn (DELE n)
-                 when (resp == Err) $ fail "cannot delete"
+                 when (resp == Err) $
+                   throwIO (ServerError "cannot delete")
 
 retr :: POP3Connection -> Int -> IO ByteString
 retr conn n = do (resp, msg) <- sendCommand conn (RETR n)
-                 when (resp == Err) $ fail "cannot retrieve"
+                 when (resp == Err) $
+                   throwIO (ServerError "cannot retrieve")
                  return $ BS.tail $ BS.dropWhile (/='\n') msg
 
 top :: POP3Connection -> Int -> Int -> IO ByteString
 top conn n m = do (resp, msg) <- sendCommand conn (TOP n m)
-                  when (resp == Err) $ fail "cannot retrieve"
+                  when (resp == Err) $
+                    throwIO (ServerError "cannot retrieve")
                   return $ BS.tail $ BS.dropWhile (/='\n') msg
 
 rset :: POP3Connection -> IO ()
 rset conn = do (resp, _) <- sendCommand conn RSET
-               when (resp == Err) $ fail "cannot reset"
+               when (resp == Err) $
+                 throwIO (ServerError "cannot reset")
 
 allList :: POP3Connection -> IO [(Int, Int)]
 allList conn = do (resp, lst) <- sendCommand conn (LIST Nothing)
-                  when (resp == Err) $ fail "cannot retrieve the list"
+                  when (resp == Err) $
+                    throwIO (ServerError "cannot retrieve the list")
                   return $ map f $ tail $ BS.lines lst
     where f s = let (n1, n2) = BS.span (/=' ') s
                 in (read $ BS.unpack n1, read $ BS.unpack $ BS.tail n2)
 
 list :: POP3Connection -> Int -> IO Int
 list conn n = do (resp, lst) <- sendCommand conn (LIST (Just n))
-                 when (resp == Err) $ fail "cannot retrieve the list"
+                 when (resp == Err) $
+                   throwIO (ServerError "cannot retrieve the list")
                  let (_, n2) = BS.span (/=' ') lst
                  return $ read $ BS.unpack $ BS.tail n2
 
 allUIDLs :: POP3Connection -> IO [(Int, ByteString)]
 allUIDLs conn = do (resp, lst) <- sendCommand conn (UIDL Nothing)
-                   when (resp == Err) $ fail "cannot retrieve the uidl list"
+                   when (resp == Err) $
+                     throwIO (ServerError "cannot retrieve the uidl list")
                    return $ map f $ tail $ BS.lines lst
     where f s = let (n1, n2) = BS.span (/=' ') s in (read $ BS.unpack n1, n2)
 
 uidl :: POP3Connection -> Int -> IO ByteString
 uidl conn n = do (resp, msg) <- sendCommand conn (UIDL (Just n))
-                 when (resp == Err) $ fail "cannot retrieve the uidl data"
+                 when (resp == Err) $
+                   throwIO (ServerError "cannot retrieve the uidl data")
                  return $ BS.tail $ BS.dropWhile (/=' ') msg
 
 closePop3 :: POP3Connection -> IO ()

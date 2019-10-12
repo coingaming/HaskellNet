@@ -84,6 +84,7 @@ import Control.Monad (unless, when)
 import Data.Char (isDigit)
 
 import Network.HaskellNet.Auth
+import Network.HaskellNet.Exception
 
 import Network.Mail.Mime
 import qualified Data.ByteString.Lazy as B
@@ -158,18 +159,14 @@ tryCommand conn cmd tries expectedReply = do
     _ | tries > 1               ->
           tryCommand conn cmd (tries - 1) expectedReply
       | otherwise               -> do
-          bsClose (bsstream conn)
-          fail $ "cannot execute command " ++ show cmd ++
-                 ", expected reply code " ++ show expectedReply ++
-                 ", but received " ++ show code ++ " " ++ BS.unpack msg
+          throwIO (UnexpectedResponse "cannot execute command" expectedReply code (BS.unpack msg))
 
 -- | create SMTPConnection from already connected Stream
 connectStream :: BSStream -> IO SMTPConnection
 connectStream st =
-    do (code1, _) <- parseResponse st
-       unless (code1 == 220) $
-              do bsClose st
-                 fail "cannot connect to the server"
+    do (code1, msg) <- parseResponse st
+       when (code1 /= 220) $
+         throwIO (UnexpectedResponse "cannot connect" 220 code1 (BS.unpack msg))
        senderHost <- getHostName
        msg <- tryCommand (SMTPC st []) (EHLO senderHost) 3 250
        return (SMTPC st (tail $ BS.lines msg))
@@ -192,7 +189,8 @@ sendCommand :: SMTPConnection -> Command -> IO (ReplyCode, ByteString)
 sendCommand (SMTPC conn _) (DATA dat) =
     do bsPutCrLf conn $ BS.pack "DATA"
        (code, _) <- parseResponse conn
-       unless (code == 354) $ fail "this server cannot accept any data."
+       when (code /= 354) $
+         throwIO (ServerError "Server not ready to accept data")
        mapM_ (sendLine . stripCR) $ BS.lines dat ++ [BS.pack "."]
        parseResponse conn
     where sendLine = bsPutCrLf conn
@@ -211,7 +209,8 @@ sendCommand (SMTPC conn _) (AUTH LOGIN username password) =
 sendCommand (SMTPC conn _) (AUTH at username password) =
     do bsPutCrLf conn command
        (code, msg) <- parseResponse conn
-       unless (code == 334) $ fail $ "authentication failed: " ++ (BS.unpack msg)
+       when (code /= 334) $
+         throwIO (AuthenticationFailed (BS.unpack msg))
        bsPutCrLf conn $ BS.pack $ auth at (BS.unpack msg) username password
        parseResponse conn
     where command = BS.pack $ unwords ["AUTH", show at]
@@ -353,7 +352,7 @@ sendMimeMail2 mail con = do
     let (Address _ from) = mailFrom mail
         recps = map (T.unpack . addressEmail)
                      $ (mailTo mail ++ mailCc mail ++ mailBcc mail)
-    when (null recps) $ fail "no receiver specified."
+    when (null recps) $ throwIO (ClientError "no receiver specified.")
     renderedMail <- renderMail' $ mail { mailBcc = [] }
     sendMail (T.unpack from) recps (lazyToStrict renderedMail) con
 

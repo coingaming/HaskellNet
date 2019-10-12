@@ -26,6 +26,7 @@ where
 import Network.Socket (PortNumber)
 import Network.Compat
 import Network.HaskellNet.BSStream
+import Network.HaskellNet.Exception
 import Network.HaskellNet.IMAP.Connection
 import Network.HaskellNet.IMAP.Types
 import Network.HaskellNet.IMAP.Parsers
@@ -127,7 +128,7 @@ connectStream :: BSStream -> IO IMAPConnection
 connectStream s =
     do msg <- bsGetLine s
        unless (and $ BS.zipWith (==) msg (BS.pack "* OK")) $
-              fail "cannot connect to the server"
+              throwIO (UnknownError "Failed to connect, server did not respond with OK")
        newConnection s
 
 ----------------------------------------------------------------------
@@ -150,15 +151,9 @@ show6 n | n > 100000 = show n
 sendCommand :: IMAPConnection -> String
             -> (RespDerivs -> Result RespDerivs (ServerResponse, MboxUpdate, v))
             -> IO v
-sendCommand imapc cmdstr pFunc =
-    do (buf, num) <- sendCommand' imapc cmdstr
-       let (resp, mboxUp, value) = eval pFunc (show6 num) buf
-       case resp of
-         OK _ _        -> do mboxUpdate imapc mboxUp
-                             return value
-         NO _ msg      -> fail ("NO: " ++ msg)
-         BAD _ msg     -> fail ("BAD: " ++ msg)
-         PREAUTH _ msg -> fail ("preauth: " ++ msg)
+sendCommand conn cmdstr pFunc =
+    do (buf, num) <- sendCommand' conn cmdstr
+       processResponse conn pFunc buf num
 
 getResponse :: BSStream -> IO ByteString
 getResponse s = unlinesCRLF <$> getLs
@@ -185,6 +180,20 @@ getResponse s = unlinesCRLF <$> getLs
           getLitLen = read . BS.unpack . snd . BS.spanEnd isDigit . BS.init
           isTagged l = BS.head l == '*' && BS.head (BS.tail l) == ' '
 
+processResponse :: IMAPConnection
+                -> (RespDerivs -> Result RespDerivs (ServerResponse, MboxUpdate, b))
+                -> ByteString
+                -> Int
+                -> IO b
+processResponse conn parser buf num =
+    let (resp, update, payload) = eval parser (show6 num) buf
+    in case resp of
+        OK _ _        -> do mboxUpdate conn update
+                            return payload
+        NO _ msg      -> throwIO (CommandError ("NO: " ++ msg))
+        BAD _ msg     -> throwIO (CommandError ("BAD: " ++ msg))
+        PREAUTH _ msg -> throwIO (CommandError ("preauth: " ++ msg))
+
 mboxUpdate :: IMAPConnection -> MboxUpdate -> IO ()
 mboxUpdate conn (MboxUpdate exists' recent') = do
   when (isJust exists') $
@@ -209,13 +218,7 @@ idle conn timeout =
                     getResponse $ stream conn
                 else
                     return buf'
-        let (resp, mboxUp, value) = eval pNone (show6 num) buf
-        case resp of
-         OK _ _        -> do mboxUpdate conn mboxUp
-                             return value
-         NO _ msg      -> fail ("NO: " ++ msg)
-         BAD _ msg     -> fail ("BAD: " ++ msg)
-         PREAUTH _ msg -> fail ("preauth: " ++ msg)
+        processResponse conn pNone buf num
 
 noop :: IMAPConnection -> IO ()
 noop conn = sendCommand conn "NOOP" pNone
@@ -239,13 +242,7 @@ authenticate conn A.LOGIN username password =
        bsGetLine (stream conn)
        bsPutCrLf (stream conn) $ BS.pack passB64
        buf <- getResponse $ stream conn
-       let (resp, mboxUp, value) = eval pNone (show6 num) buf
-       case resp of
-         OK _ _        -> do mboxUpdate conn $ mboxUp
-                             return value
-         NO _ msg      -> fail ("NO: " ++ msg)
-         BAD _ msg     -> fail ("BAD: " ++ msg)
-         PREAUTH _ msg -> fail ("preauth: " ++ msg)
+       processResponse conn pNone buf num
     where (userB64, passB64) = A.login username password
 authenticate conn at username password =
     do (c, num) <- sendCommand' conn $ "AUTHENTICATE " ++ show at
@@ -257,13 +254,7 @@ authenticate conn at username password =
        bsPutCrLf (stream conn) $ BS.pack $
                  A.auth at challenge username password
        buf <- getResponse $ stream conn
-       let (resp, mboxUp, value) = eval pNone (show6 num) buf
-       case resp of
-         OK _ _        -> do mboxUpdate conn $ mboxUp
-                             return value
-         NO _ msg      -> fail ("NO: " ++ msg)
-         BAD _ msg     -> fail ("BAD: " ++ msg)
-         PREAUTH _ msg -> fail ("preauth: " ++ msg)
+       processResponse conn pNone buf num
 
 _select :: String -> IMAPConnection -> String -> IO ()
 _select cmd conn mboxName =
@@ -324,16 +315,11 @@ appendFull conn mbox mailData flags' time =
                 (concat ["APPEND ", mbox
                         , fstr, tstr, " {" ++ show len ++ "}"])
        when (BS.null buf || (BS.head buf /= '+')) $
-              fail "illegal server response"
+              throwIO (ServerError "Illegal server response")
        mapM_ (bsPutCrLf $ stream conn) mailLines
        bsPutCrLf (stream conn) BS.empty
        buf2 <- getResponse $ stream conn
-       let (resp, mboxUp, ()) = eval pNone (show6 num) buf2
-       case resp of
-         OK _ _ -> mboxUpdate conn mboxUp
-         NO _ msg -> fail ("NO: "++msg)
-         BAD _ msg -> fail ("BAD: "++msg)
-         PREAUTH _ msg -> fail ("PREAUTH: "++msg)
+       processResponse conn pNone buf2 num
     where mailLines = BS.lines mailData
           len       = sum $ map ((2+) . BS.length) mailLines
           tstr      = maybe "" ((" "++) . show) time
@@ -494,8 +480,8 @@ escapeLogin x = "\"" ++ replaceSpecialChars x ++ "\""
     where
         replaceSpecialChars ""     = ""
         replaceSpecialChars (c:cs) = escapeChar c ++ replaceSpecialChars cs
-        escapeChar '"' = "\\\""
+        escapeChar '"'  = "\\\""
         escapeChar '\\' = "\\\\"
-        escapeChar '{' = "\\{"
-        escapeChar '}' = "\\}"
-        escapeChar s   = [s]
+        escapeChar '{'  = "\\{"
+        escapeChar '}'  = "\\}"
+        escapeChar s    = [s]
